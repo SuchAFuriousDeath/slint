@@ -11,6 +11,7 @@ use crate::SharedVector;
 use alloc::string::String;
 use core::fmt::{Debug, Display, Write};
 use core::ops::Deref;
+use std::path::PAath
 
 /// This macro is the same as [`std::format!`], but it returns a [`SharedString`] instead.
 ///
@@ -166,6 +167,22 @@ impl AsRef<std::ffi::CStr> for SharedString {
         // Safety: we ensure that there is always a terminated \0
         debug_assert_eq!(self.inner.as_slice()[self.inner.len() - 1], 0);
         unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(self.inner.as_slice()) }
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRef<std::path::Path> for SharedString {
+    #[inline]
+    fn as_ref(&self) -> &std::path::Path {
+        self.as_str().as_ref()
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRef<std::ffi::OsStr> for SharedString {
+    #[inline]
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.as_str().as_ref()
     }
 }
 
