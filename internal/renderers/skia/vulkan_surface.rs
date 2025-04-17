@@ -9,6 +9,12 @@ use i_slint_core::api::{PhysicalSize as PhysicalWindowSize, Window};
 use i_slint_core::graphics::RequestedGraphicsAPI;
 use i_slint_core::item_rendering::DirtyRegion;
 
+use ash::vk::{
+    AccessFlags, CommandBuffer, CommandBufferAllocateInfo, CommandBufferBeginInfo,
+    CommandBufferUsageFlags, CommandPoolCreateFlags, DependencyFlags, ImageAspectFlags,
+    ImageLayout, ImageMemoryBarrier, ImageSubresourceRange, PipelineStageFlags, PresentInfoKHR,
+    SubmitInfo,
+};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
@@ -16,9 +22,11 @@ use vulkano::device::{
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
-use vulkano::swapchain::{Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo};
+use vulkano::swapchain::{Surface, Swapchain, SwapchainCreateInfo};
+use vulkano::sync::fence::{Fence, FenceCreateFlags, FenceCreateInfo};
+use vulkano::sync::semaphore::Semaphore;
 use vulkano::sync::GpuFuture;
-use vulkano::{sync, Handle, Validated, VulkanError, VulkanLibrary, VulkanObject};
+use vulkano::{sync, Handle, VulkanLibrary, VulkanObject};
 
 /// This surface renders into the given window using Vulkan.
 pub struct VulkanSurface {
@@ -28,8 +36,11 @@ pub struct VulkanSurface {
     previous_frame_end: RefCell<Option<Box<dyn GpuFuture>>>,
     queue: Arc<Queue>,
     swapchain: RefCell<Arc<Swapchain>>,
-    swapchain_images: RefCell<Vec<Arc<Image>>>,
-    swapchain_image_views: RefCell<Vec<Arc<ImageView>>>,
+    swapchain_image_views: RefCell<Vec<(Arc<ImageView>, bool)>>,
+    in_flight_fence: Fence,
+    cbf1: CommandBuffer,
+    cbf2: CommandBuffer,
+    command_pool: ash::vk::CommandPool,
 }
 
 impl VulkanSurface {
@@ -70,6 +81,7 @@ impl VulkanSurface {
                 .physical_device()
                 .surface_capabilities(&surface, Default::default())
                 .map_err(|vke| format!("Error matching Vulkan surface capabilities: {vke}"))?;
+
             let image_format = vulkano::format::Format::B8G8R8A8_UNORM.into();
 
             Swapchain::new(
@@ -91,13 +103,16 @@ impl VulkanSurface {
             .map_err(|vke| format!("Error creating Vulkan swapchain: {vke}"))?
         };
 
-        let mut swapchain_image_views = Vec::with_capacity(swapchain_images.len());
+        let swapchain_image_views = swapchain_images
+            .into_iter()
+            .map(|image| {
+                let image_view = ImageView::new_default(image).map_err(|vke| {
+                    format!("fatal: Error creating image view for swap chain image: {vke}")
+                });
 
-        for image in &swapchain_images {
-            swapchain_image_views.push(ImageView::new_default(image.clone()).map_err(|vke| {
-                format!("fatal: Error creating image view for swap chain image: {vke}")
-            })?);
-        }
+                image_view.map(|image_view| (image_view, true))
+            })
+            .collect::<Result<_, String>>()?;
 
         let instance = physical_device.instance();
         let library = instance.library();
@@ -139,6 +154,41 @@ impl VulkanSurface {
 
         let previous_frame_end = RefCell::new(Some(sync::now(device.clone()).boxed()));
 
+        // Create a fence that is already signaled, otherwise we would get stuck on rendering the first frame.
+        let in_flight_fence = Fence::new(
+            device.clone(),
+            FenceCreateInfo { flags: FenceCreateFlags::SIGNALED, ..Default::default() },
+        )
+        .unwrap();
+
+        let instance_handle = device.instance().fns();
+
+        let ash_device = unsafe { ash::Device::load(&instance_handle.v1_0, device.handle()) };
+
+        let command_pool = unsafe {
+            ash_device.create_command_pool(
+                &ash::vk::CommandPoolCreateInfo {
+                    queue_family_index,
+                    flags: CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                    ..Default::default()
+                },
+                None,
+            )
+        }
+        .unwrap();
+
+        let command_buffers = unsafe {
+            ash_device.allocate_command_buffers(&CommandBufferAllocateInfo {
+                command_buffer_count: 2,
+                command_pool,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+
+        let cbf1 = command_buffers[0];
+        let cbf2 = command_buffers[1];
+
         Ok(Self {
             gr_context: RefCell::new(gr_context),
             recreate_swapchain: Cell::new(false),
@@ -146,8 +196,11 @@ impl VulkanSurface {
             previous_frame_end,
             queue,
             swapchain: RefCell::new(swapchain),
-            swapchain_images: RefCell::new(swapchain_images),
             swapchain_image_views: RefCell::new(swapchain_image_views),
+            in_flight_fence,
+            cbf1,
+            cbf2,
+            command_pool,
         })
     }
 
@@ -258,7 +311,15 @@ impl super::Surface for VulkanSurface {
     ) -> Result<(), i_slint_core::platform::PlatformError> {
         let gr_context = &mut self.gr_context.borrow_mut();
 
-        let device = self.device.clone();
+        let instance_handle = self.device.instance().fns();
+
+        let ash_device = unsafe { ash::Device::load(&instance_handle.v1_0, self.device.handle()) };
+
+        // Wait for the previous frame to finish
+        unsafe { ash_device.wait_for_fences(&[self.in_flight_fence.handle()], true, u64::MAX) }
+            .unwrap();
+
+        unsafe { ash_device.reset_fences(&[self.in_flight_fence.handle()]) }.unwrap();
 
         self.previous_frame_end.borrow_mut().as_mut().unwrap().cleanup_finished();
 
@@ -273,47 +334,126 @@ impl super::Surface for VulkanSurface {
 
             *swapchain = new_swapchain;
 
-            let mut new_swapchain_image_views = Vec::with_capacity(new_images.len());
+            let new_swapchain_image_views = new_images
+                .into_iter()
+                .map(|image| {
+                    let image_view = ImageView::new_default(image).map_err(|vke| {
+                        format!("fatal: Error creating image view for swap chain image: {vke}")
+                    });
 
-            for image in &new_images {
-                new_swapchain_image_views.push(ImageView::new_default(image.clone()).map_err(
-                    |vke| format!("fatal: Error creating image view for swap chain image: {vke}"),
-                )?);
-            }
+                    image_view.map(|image_view| (image_view, true))
+                })
+                .collect::<Result<_, String>>()?;
 
-            *self.swapchain_images.borrow_mut() = new_images;
             *self.swapchain_image_views.borrow_mut() = new_swapchain_image_views;
         }
 
         let swapchain = self.swapchain.borrow().clone();
 
-        let (image_index, suboptimal, acquire_future) =
-            match vulkano::swapchain::acquire_next_image(swapchain.clone(), None)
-                .map_err(Validated::unwrap)
-            {
-                Ok(r) => r,
-                Err(VulkanError::OutOfDate) => {
-                    self.recreate_swapchain.set(true);
-                    return Ok(()); // Try again next frame
-                }
-                Err(e) => return Err(format!("Vulkan: failed to acquire next image: {e}").into()),
-            };
+        let mut image_index = 0;
 
-        if suboptimal {
-            self.recreate_swapchain.set(true);
+        let image_available_sem = Semaphore::from_pool(self.device.clone()).unwrap();
+        let layout_ready_sem = Semaphore::from_pool(self.device.clone()).unwrap();
+        let present_ready_sem = Semaphore::from_pool(self.device.clone()).unwrap();
+
+        // Acquire next image
+        let result = unsafe {
+            (self.device.fns().khr_swapchain.acquire_next_image_khr)(
+                self.device.handle(),
+                swapchain.handle(),
+                u64::MAX,
+                image_available_sem.handle(),
+                ash::vk::Fence::null(),
+                &mut image_index,
+            )
+        };
+
+        match result {
+            ash::vk::Result::SUCCESS => {}
+            ash::vk::Result::ERROR_OUT_OF_DATE_KHR => {
+                self.recreate_swapchain.set(true);
+                return Ok(());
+            }
+            _ => return Err(format!("Error acquiring next image: {result:?}").into()),
         }
 
-        let width = swapchain.image_extent()[0];
+        let [width, height] = swapchain.image_extent();
+
         let width: i32 = width
             .try_into()
             .map_err(|_| format!("internal error: invalid swapchain image width {width}"))?;
-        let height = swapchain.image_extent()[1];
         let height: i32 = height
             .try_into()
             .map_err(|_| format!("internal error: invalid swapchain image height {height}"))?;
 
-        let image_view = self.swapchain_image_views.borrow()[image_index as usize].clone();
+        let mut swapchain_image_views = self.swapchain_image_views.borrow_mut();
+
+        let (image_view, undefined_layout) =
+            swapchain_image_views.get_mut(image_index as usize).unwrap();
         let image_object = image_view.image();
+
+        // This command buffer ensures proper image layout transitions
+        unsafe {
+            ash_device.begin_command_buffer(
+                self.cbf1,
+                &CommandBufferBeginInfo {
+                    flags: CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                    ..Default::default()
+                },
+            )
+        }
+        .unwrap();
+
+        // Transition image layout from present so that skia can draw to it
+        let barrier = ImageMemoryBarrier::builder()
+            .src_access_mask(AccessFlags::empty())
+            .dst_access_mask(AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .old_layout(if *undefined_layout {
+                ImageLayout::UNDEFINED
+            } else {
+                ImageLayout::PRESENT_SRC_KHR
+            })
+            .new_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .src_queue_family_index(self.queue.queue_family_index())
+            .dst_queue_family_index(self.queue.queue_family_index())
+            .image(image_object.handle())
+            .subresource_range(
+                ImageSubresourceRange::builder()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1)
+                    .build(),
+            )
+            .build();
+
+        // Technically, the layout will only stop being undefined once we sync the cpu with the gpu, which is not true here, but it will be next time we read the information in the next frame
+        *undefined_layout = false;
+
+        unsafe {
+            ash_device.cmd_pipeline_barrier(
+                self.cbf1,
+                PipelineStageFlags::TOP_OF_PIPE,
+                PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            )
+        };
+
+        unsafe { ash_device.end_command_buffer(self.cbf1) }.unwrap();
+
+        let submit_info = SubmitInfo::builder()
+            .wait_semaphores(&[image_available_sem.handle()])
+            .wait_dst_stage_mask(&[PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+            .command_buffers(&[self.cbf1])
+            .signal_semaphores(&[layout_ready_sem.handle()])
+            .build();
+
+        unsafe {
+            ash_device.queue_submit(self.queue.handle(), &[submit_info], ash::vk::Fence::null())
+        }
+        .unwrap();
 
         let format = image_view.format();
 
@@ -354,36 +494,101 @@ impl super::Surface for VulkanSurface {
 
         drop(skia_surface);
 
+        /*unsafe { skia_bindings::GrDirectContext_wait(gr_context.deref_mut(), 1, todo!(), false) };
+
+        let mut flush_info: skia_bindings::GrFlushInfo = unsafe { std::mem::zeroed() };
+
+        flush_info.fNumSemaphores = 1;
+        flush_info.fSignalSemaphores = todo!();
+
+        let flush_info = &flush_info as *const skia_bindings::GrFlushInfo as *const FlushInfo;
+        */
+
+        gr_context.flush(None /*Some(unsafe { &*flush_info })*/);
+
         gr_context.submit(None);
+
+        // This command buffer ensures proper image layout transitions
+        unsafe {
+            ash_device.begin_command_buffer(
+                self.cbf2,
+                &CommandBufferBeginInfo {
+                    flags: CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                    ..Default::default()
+                },
+            )
+        }
+        .unwrap();
+
+        // Transition image layout from present so that skia can draw to it
+        let barrier = ImageMemoryBarrier::builder()
+            .src_access_mask(AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(AccessFlags::empty())
+            .old_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(ImageLayout::PRESENT_SRC_KHR)
+            .src_queue_family_index(self.queue.queue_family_index())
+            .dst_queue_family_index(self.queue.queue_family_index())
+            .image(image_object.handle())
+            .subresource_range(
+                ImageSubresourceRange::builder()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1)
+                    .build(),
+            )
+            .build();
+
+        unsafe {
+            ash_device.cmd_pipeline_barrier(
+                self.cbf2,
+                PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                PipelineStageFlags::BOTTOM_OF_PIPE,
+                DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            )
+        };
+
+        unsafe { ash_device.end_command_buffer(self.cbf2) }.unwrap();
+
+        let submit_info = SubmitInfo::builder()
+            .wait_semaphores(&[layout_ready_sem.handle()])
+            .wait_dst_stage_mask(&[PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+            .command_buffers(&[self.cbf2])
+            .signal_semaphores(&[present_ready_sem.handle()])
+            .build();
+
+        unsafe {
+            ash_device.queue_submit(
+                self.queue.handle(),
+                &[submit_info],
+                self.in_flight_fence.handle(),
+            )
+        }
+        .unwrap();
 
         if let Some(pre_present_callback) = pre_present_callback.borrow_mut().as_mut() {
             pre_present_callback();
         }
 
-        let future = self
-            .previous_frame_end
-            .borrow_mut()
-            .take()
-            .unwrap()
-            .join(acquire_future)
-            .then_swapchain_present(
-                self.queue.clone(),
-                SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_index),
+        let present_result = unsafe {
+            (self.device.fns().khr_swapchain.queue_present_khr)(
+                self.queue.handle(),
+                &PresentInfoKHR::builder()
+                    .wait_semaphores(&[present_ready_sem.handle()])
+                    .swapchains(&[swapchain.handle()])
+                    .image_indices(&[image_index])
+                    .build(),
             )
-            .then_signal_fence_and_flush();
+        };
 
-        match future.map_err(Validated::unwrap) {
-            Ok(future) => {
-                *self.previous_frame_end.borrow_mut() = Some(future.boxed());
+        match present_result {
+            ash::vk::Result::SUCCESS => {}
+            ash::vk::Result::ERROR_OUT_OF_DATE_KHR | ash::vk::Result::SUBOPTIMAL_KHR => {
+                self.recreate_swapchain.set(true)
             }
-            Err(VulkanError::OutOfDate) => {
-                self.recreate_swapchain.set(true);
-                *self.previous_frame_end.borrow_mut() = Some(sync::now(device.clone()).boxed());
-            }
-            Err(e) => {
-                *self.previous_frame_end.borrow_mut() = Some(sync::now(device.clone()).boxed());
-                return Err(format!("Skia Vulkan renderer: failed to flush future: {e}").into());
-            }
+            _ => return Err(format!("Error presenting image: {present_result:?}").into()),
         }
 
         Ok(())
@@ -403,6 +608,20 @@ impl super::Surface for VulkanSurface {
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+}
+
+impl Drop for VulkanSurface {
+    fn drop(&mut self) {
+        let instance_handle = self.device.instance().fns();
+
+        let ash_device = unsafe { ash::Device::load(&instance_handle.v1_0, self.device.handle()) };
+
+        unsafe {
+            ash_device.device_wait_idle().unwrap();
+            ash_device.free_command_buffers(self.command_pool, &[self.cbf1, self.cbf2]);
+            ash_device.destroy_command_pool(self.command_pool, None);
+        }
     }
 }
 
