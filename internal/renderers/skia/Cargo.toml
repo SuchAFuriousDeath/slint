@@ -73,7 +73,7 @@ windows = { version = "0.58.0", features = [
     "Win32_System_Threading",
     "Win32_Security",
 ] }
-skia-safe = { version = "0.82.0", features = ["d3d"] }
+skia-safe = { version = "0.84.0", features = ["d3d"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = { version = "0.6.0" }
@@ -104,7 +104,7 @@ objc2-app-kit = { version = "0.3.0", default-features = false, features = [
 objc2-core-foundation = { version = "0.3.0", default-features = false, features = [
     "CFCGTypes",
 ] }
-skia-safe = { version = "0.82.0", features = ["metal"] }
+skia-safe = { version = "0.84.0", features = ["metal"] }
 raw-window-metal = "1.0"
 
 [target.'cfg(not(any(target_vendor = "apple", target_family = "windows")))'.dependencies]
