@@ -85,6 +85,7 @@ use crate::expression_tree::{BuiltinFunction, Callable, Expression, NamedReferen
 use crate::langtype::{ElementType, Type};
 use crate::object_tree::*;
 use core::cell::RefCell;
+use i_slint_common::MENU_SEPARATOR_PLACEHOLDER_TITLE;
 use smol_str::{format_smolstr, SmolStr};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
@@ -151,11 +152,12 @@ pub async fn lower_menus(
     assert!(matches!(&useful_menu_component.menu_entry, Type::Struct(..)));
 
     let mut has_menu = false;
+    let mut has_menubar = false;
 
     doc.visit_all_used_components(|component| {
         recurse_elem_including_sub_components_no_borrow(component, &(), &mut |elem, _| {
             if matches!(&elem.borrow().builtin_type(), Some(b) if b.name == "Window") {
-                has_menu |= process_window(elem, &useful_menu_component, diag);
+                has_menubar |= process_window(elem, &useful_menu_component, type_loader.compiler_config.no_native_menu, diag);
             }
             if matches!(&elem.borrow().builtin_type(), Some(b) if matches!(b.name.as_str(), "ContextMenuArea" | "ContextMenuInternal")) {
                 has_menu |= process_context_menu(elem, &useful_menu_component, diag);
@@ -163,6 +165,14 @@ pub async fn lower_menus(
         })
     });
 
+    if has_menubar {
+        recurse_elem_including_sub_components_no_borrow(&menubar_impl, &(), &mut |elem, _| {
+            if matches!(&elem.borrow().builtin_type(), Some(b) if matches!(b.name.as_str(), "ContextMenuArea" | "ContextMenuInternal"))
+            {
+                has_menu |= process_context_menu(elem, &useful_menu_component, diag);
+            }
+        });
+    }
     if has_menu {
         let popup_menu_impl = type_loader
             .import_component("std-widgets.slint", "PopupMenuImpl", &mut build_diags_to_ignore)
@@ -200,6 +210,11 @@ fn process_context_menu(
     diag: &mut BuildDiagnostics,
 ) -> bool {
     let is_internal = matches!(&context_menu_elem.borrow().base_type, ElementType::Builtin(b) if b.name == "ContextMenuInternal");
+
+    if is_internal && context_menu_elem.borrow().property_declarations.contains_key(ENTRIES) {
+        // Already processed;
+        return false;
+    }
 
     let item_tree_root = if !is_internal {
         // Lower Menu into entries
@@ -305,6 +320,7 @@ fn process_context_menu(
 fn process_window(
     win: &ElementRc,
     components: &UsefulMenuComponents,
+    no_native_menu: bool,
     diag: &mut BuildDiagnostics,
 ) -> bool {
     let mut window = win.borrow_mut();
@@ -345,7 +361,7 @@ fn process_window(
         id: format_smolstr!("{}-menulayout", window.id),
         base_type: components.menubar_impl.clone(),
         enclosing_component: window.enclosing_component.clone(),
-        repeated: Some(crate::object_tree::RepeatedElementInfo {
+        repeated: (!no_native_menu).then(|| crate::object_tree::RepeatedElementInfo {
             model: Expression::UnaryOp {
                 op: '!',
                 sub: Expression::FunctionCall {
@@ -414,22 +430,6 @@ fn process_window(
     menu_bar.borrow_mut().base_type = components.vertical_layout.clone();
     menu_bar.borrow_mut().children = vec![menubar_impl, child];
 
-    let mut arguments = vec![
-        Expression::PropertyReference(NamedReference::new(&menu_bar, SmolStr::new_static(ENTRIES))),
-        Expression::PropertyReference(NamedReference::new(
-            &menu_bar,
-            SmolStr::new_static(SUB_MENU),
-        )),
-        Expression::PropertyReference(NamedReference::new(
-            &menu_bar,
-            SmolStr::new_static(ACTIVATED),
-        )),
-    ];
-
-    if let Some(item_tree_root) = item_tree_root {
-        arguments.push(item_tree_root.into());
-    }
-
     for prop in [ENTRIES, SUB_MENU, ACTIVATED] {
         menu_bar
             .borrow()
@@ -440,13 +440,7 @@ fn process_window(
             .is_set = true;
     }
 
-    let setup_menubar = Expression::FunctionCall {
-        function: BuiltinFunction::SetupNativeMenuBar.into(),
-        arguments,
-        source_location: source_location.clone(),
-    };
-
-    window.children.push(menu_bar);
+    window.children.push(menu_bar.clone());
     let component = window.enclosing_component.upgrade().unwrap();
     drop(window);
 
@@ -460,7 +454,33 @@ fn process_window(
     // except for the actual geometry
     win.borrow_mut().geometry_props.as_mut().unwrap().height = win_height;
 
-    component.init_code.borrow_mut().constructor_code.push(setup_menubar.into());
+    if !no_native_menu || item_tree_root.is_some() {
+        let mut arguments = vec![
+            Expression::PropertyReference(NamedReference::new(
+                &menu_bar,
+                SmolStr::new_static(ENTRIES),
+            )),
+            Expression::PropertyReference(NamedReference::new(
+                &menu_bar,
+                SmolStr::new_static(SUB_MENU),
+            )),
+            Expression::PropertyReference(NamedReference::new(
+                &menu_bar,
+                SmolStr::new_static(ACTIVATED),
+            )),
+        ];
+
+        if let Some(item_tree_root) = item_tree_root {
+            arguments.push(item_tree_root.into());
+            arguments.push(Expression::BoolLiteral(!no_native_menu));
+        }
+        let setup_menubar = Expression::FunctionCall {
+            function: BuiltinFunction::SetupNativeMenuBar.into(),
+            arguments,
+            source_location,
+        };
+        component.init_code.borrow_mut().constructor_code.push(setup_menubar.into());
+    }
     true
 }
 
@@ -531,7 +551,18 @@ fn lower_menu_items(
                     ));
                     element.borrow_mut().enclosing_component = component_weak.clone();
                     element.borrow_mut().geometry_props = None;
-                    // Menu -> MenuItem
+                    if element.borrow().base_type.type_name() == Some("MenuSeparator") {
+                        element.borrow_mut().bindings.insert(
+                            "title".into(),
+                            RefCell::new(
+                                Expression::StringLiteral(SmolStr::new_static(
+                                    MENU_SEPARATOR_PLACEHOLDER_TITLE,
+                                ))
+                                .into(),
+                            ),
+                        );
+                    }
+                    // Menu/MenuSeparator -> MenuItem
                     element.borrow_mut().base_type = components.menu_item_element.clone();
                 }
                 false
@@ -593,14 +624,21 @@ fn generate_menu_entries(
     state: &mut GenMenuState,
 ) -> Vec<Expression> {
     let mut entries = Vec::new();
+    let mut last_is_separator = false;
 
     for item in menu_items {
         let mut borrow_mut = item.borrow_mut();
         let base_name = borrow_mut.base_type.type_name().unwrap();
         let is_sub_menu = base_name == "Menu";
-        if !is_sub_menu {
+        let is_separator = base_name == "MenuSeparator";
+        if !is_sub_menu && !is_separator {
             assert_eq!(base_name, "MenuItem");
         }
+
+        if is_separator && (last_is_separator || entries.is_empty()) {
+            continue;
+        }
+        last_is_separator = is_separator;
 
         borrow_mut
             .enclosing_component
@@ -613,12 +651,6 @@ fn generate_menu_entries(
         assert!(borrow_mut.repeated.is_none());
 
         let mut values = HashMap::<SmolStr, Expression>::new();
-        for prop in ["title"] {
-            if let Some(binding) = borrow_mut.bindings.remove(prop) {
-                values.insert(SmolStr::new_static(prop), binding.into_inner().expression);
-            }
-        }
-
         state.id += 1;
         let id_str = format_smolstr!("{}", state.id);
         values.insert(SmolStr::new_static("id"), Expression::StringLiteral(id_str.clone()));
@@ -639,7 +671,25 @@ fn generate_menu_entries(
                 .insert(SmolStr::new_static("has-sub-menu"), Expression::BoolLiteral(true).into());
         }
 
+        drop(borrow_mut);
+        if !is_separator {
+            for prop in ["title", "enabled"] {
+                if item.borrow().bindings.contains_key(prop) {
+                    let n = SmolStr::new_static(prop);
+                    values.insert(
+                        n.clone(),
+                        Expression::PropertyReference(NamedReference::new(&item, n)),
+                    );
+                }
+            }
+        } else {
+            values.insert(SmolStr::new_static("is_separator"), Expression::BoolLiteral(true));
+        }
+
         entries.push(mk_struct(state.menu_entry.clone(), values));
+    }
+    if last_is_separator {
+        entries.pop();
     }
 
     entries

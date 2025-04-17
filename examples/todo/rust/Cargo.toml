@@ -33,4 +33,3 @@ slint-build = { path = "../../../api/rs/build" }
 
 [dev-dependencies]
 i-slint-backend-testing = { workspace = true }
-

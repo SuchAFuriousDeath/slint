@@ -194,10 +194,12 @@ macro_rules! for_each_builtin_structs {
                     /// an opaque id that can be used to identify the menu entry
                     id: SharedString,
                     // keyboard_shortcut: KeySequence,
-                    // /// whether the menu entry is enabled
-                    // enabled: bool,
+                    /// whether the menu entry is enabled
+                    enabled: bool,
                     /// Sub menu
                     has_sub_menu: bool,
+                    /// The menu entry is a separator
+                    is_separator: bool,
                 }
                 private {}
             }

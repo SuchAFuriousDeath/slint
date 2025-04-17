@@ -13,11 +13,12 @@ export component FloatWidget inherits GridLayout {
     in property <string> property-name;
     in property <PropertyValue> property-value;
 
+    callback update-display-string(value: string);
+
     callback test-float-binding(text: string, unit: string) -> bool;
     callback set-float-binding(text: string, unit: string);
 
     private property <string> current-unit;
-    private property <PropertyValue> dummy: self.property-value;
 
     pure function find_current_unit(value: PropertyValue) -> string {
         if value.visual-items.length == 0 {
@@ -31,6 +32,9 @@ export component FloatWidget inherits GridLayout {
     }
 
     function set-binding() {
+        if number.text != "" {
+            root.update-display-string("\{number.text}\{self.current-unit}");
+        }
         root.set-float-binding(number.text == "" ? "" : number.text, self.current-unit);
     }
 
@@ -43,7 +47,7 @@ export component FloatWidget inherits GridLayout {
         current-unit = find_current_unit(property-value);
     }
 
-    changed dummy => {
+    changed property-value => {
         if !number.has-focus && self.property-value.kind == PropertyValueKind.float {
             apply-value();
         }
@@ -54,7 +58,6 @@ export component FloatWidget inherits GridLayout {
     }
 
     spacing-vertical: EditorSpaceSettings.default-spacing;
-    width: 100%;
 
     Row {
         NameLabel {

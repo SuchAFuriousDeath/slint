@@ -30,5 +30,3 @@ console_error_panic_hook = "0.1.5"
 
 [build-dependencies]
 slint-build = { path = "../../../api/rs/build" }
-
-

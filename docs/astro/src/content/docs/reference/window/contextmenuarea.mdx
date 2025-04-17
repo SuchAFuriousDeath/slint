@@ -30,13 +30,19 @@ Close the context menu if it's currently open.
 ## `Menu`
 
 Place the `Menu` element in a <Link type="MenuBar" />, a `ContextMenuArea`, or within another `Menu`.
-Use `MenuItem` children of individual menu items, and `Menu` children to create sub-menus.
+Use `MenuItem` children of individual menu items, `Menu` children to create sub-menus, and `MenuSeparator` to create separators.
 
 ### Properties of `Menu`
 
 #### title
 <SlintProperty propName="title" typeName="string" defaultValue='""'>
 This is the label of the menu as written in the menu bar or in the parent menu.
+</SlintProperty>
+
+#### enabled
+
+<SlintProperty propName="enabled" typeName="bool" defaultValue="true">
+When disabled, the `Menu` can be selected but not activated.
 </SlintProperty>
 
 ## `MenuItem`
@@ -51,11 +57,24 @@ A `MenuItem` represents a single menu entry. It's must be a child of a `Menu` el
 The title shown for this menu item.
 </SlintProperty>
 
+#### enabled
+
+<SlintProperty propName="enabled" typeName="bool" defaultValue="true">
+When disabled, the `MenuItem` can be selected but not activated.
+</SlintProperty>
+
 ### Callbacks of `MenuItem`
 
 #### activated()
 
 Invoked when the menu entry is activated.
+
+## `MenuSeparator`
+
+A `MenuSeparator` represents a separator in a menu.
+It cannot have children, and doesn't have properties or callbacks.
+MenuSeparator at the beginning or end of a menu will not be visible.
+Consecutive `MenuSeparator`s will be merged into one.
 
 ## Example
 
@@ -74,6 +93,16 @@ export component Example {
             MenuItem {
                 title: @tr("Paste");
                 activated => { debug("Paste"); }
+            }
+            MenuSeparator {}
+            Menu {
+                title: @tr("Find");
+                MenuItem {
+                    title: @tr("Find Next");
+                }
+                MenuItem {
+                    title: @tr("Find Previous");
+                }
             }
         }
     }

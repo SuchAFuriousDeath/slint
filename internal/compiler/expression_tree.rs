@@ -54,8 +54,6 @@ pub enum BuiltinFunction {
     /// When it is a menu item tree, it is a ElementReference to the root of the tree, and in the LLR, a NumberLiteral to an index in  [`crate::llr::SubComponent::menu_item_trees`]
     ShowPopupMenu,
     SetSelectionOffsets,
-    /// A function that belongs to an item (such as TextInput's select-all function).
-    ItemMemberFunction(SmolStr),
     ItemFontMetrics,
     /// the "42".to_float()
     StringToFloat,
@@ -65,6 +63,8 @@ pub enum BuiltinFunction {
     StringIsEmpty,
     /// the "42".length
     StringCharacterCount,
+    StringToLowercase,
+    StringToUppercase,
     ColorRgbaStruct,
     ColorHsvaStruct,
     ColorBrighter,
@@ -79,9 +79,11 @@ pub enum BuiltinFunction {
     ColorScheme,
     SupportsNativeMenuBar,
     /// Setup the native menu bar, or the item-tree based menu bar
-    /// arguments ate: `(ref entries, ref sub-menu, ref activated, item_tree_root?)`
-    /// When there are 4 arguments, the last one is a reference to the MenuItem tree root (just like the entries in the [`Self::ShowPopupMenu`] call)
-    /// then the code will assign the callback handler and properties
+    /// arguments are: `(ref entries, ref sub-menu, ref activated, item_tree_root?, no_native_menu_bar?)`
+    /// The two last arguments are only set if the menu is an item tree, in which case, `item_tree_root` is a reference
+    /// to the MenuItem tree root (just like the entries in the [`Self::ShowPopupMenu`] call), and `native_menu_bar` is
+    /// is a boolean literal that is true when we shouldn't try to setup the native menu bar.
+    /// If we have an item_tree_root, the code will assign the callback handler and properties on the non-native menubar as well
     SetupNativeMenuBar,
     Use24HourFormat,
     MonthDayCount,
@@ -180,13 +182,14 @@ declare_builtin_function_types!(
     ShowPopupWindow: (Type::ElementReference) -> Type::Void,
     ClosePopupWindow: (Type::ElementReference) -> Type::Void,
     ShowPopupMenu: (Type::ElementReference, Type::Model, typeregister::logical_point_type()) -> Type::Void,
-    ItemMemberFunction(..): (Type::ElementReference) -> Type::Void,
     SetSelectionOffsets: (Type::ElementReference, Type::Int32, Type::Int32) -> Type::Void,
     ItemFontMetrics: (Type::ElementReference) -> typeregister::font_metrics_type(),
     StringToFloat: (Type::String) -> Type::Float32,
     StringIsFloat: (Type::String) -> Type::Bool,
     StringIsEmpty: (Type::String) -> Type::Bool,
     StringCharacterCount: (Type::String) -> Type::Int32,
+    StringToLowercase: (Type::String) -> Type::String,
+    StringToUppercase: (Type::String) -> Type::String,
     ImplicitLayoutInfo(..): (Type::ElementReference) -> Type::Struct(typeregister::layout_info_type()),
     ColorRgbaStruct: (Type::Color) -> Type::Struct(Rc::new(Struct {
         fields: IntoIterator::into_iter([
@@ -301,12 +304,13 @@ impl BuiltinFunction {
             | BuiltinFunction::ClosePopupWindow
             | BuiltinFunction::ShowPopupMenu => false,
             BuiltinFunction::SetSelectionOffsets => false,
-            BuiltinFunction::ItemMemberFunction(..) => false,
             BuiltinFunction::ItemFontMetrics => false, // depends also on Window's font properties
             BuiltinFunction::StringToFloat
             | BuiltinFunction::StringIsFloat
             | BuiltinFunction::StringIsEmpty
-            | BuiltinFunction::StringCharacterCount => true,
+            | BuiltinFunction::StringCharacterCount
+            | BuiltinFunction::StringToLowercase
+            | BuiltinFunction::StringToUppercase => true,
             BuiltinFunction::ColorRgbaStruct
             | BuiltinFunction::ColorHsvaStruct
             | BuiltinFunction::ColorBrighter
@@ -377,12 +381,13 @@ impl BuiltinFunction {
             | BuiltinFunction::ClosePopupWindow
             | BuiltinFunction::ShowPopupMenu => false,
             BuiltinFunction::SetSelectionOffsets => false,
-            BuiltinFunction::ItemMemberFunction(..) => false,
             BuiltinFunction::ItemFontMetrics => true,
             BuiltinFunction::StringToFloat
             | BuiltinFunction::StringIsFloat
             | BuiltinFunction::StringIsEmpty
-            | BuiltinFunction::StringCharacterCount => true,
+            | BuiltinFunction::StringCharacterCount
+            | BuiltinFunction::StringToLowercase
+            | BuiltinFunction::StringToUppercase => true,
             BuiltinFunction::ColorRgbaStruct
             | BuiltinFunction::ColorHsvaStruct
             | BuiltinFunction::ColorBrighter
@@ -713,6 +718,11 @@ pub enum Expression {
         rhs: Box<Expression>,
     },
 
+    DebugHook {
+        expression: Box<Expression>,
+        id: SmolStr,
+    },
+
     EmptyComponentFactory,
 }
 
@@ -834,6 +844,7 @@ impl Expression {
             Expression::SolveLayout(..) => Type::LayoutCache,
             Expression::MinMax { ty, .. } => ty.clone(),
             Expression::EmptyComponentFactory => Type::ComponentFactory,
+            Expression::DebugHook { expression, .. } => expression.ty(),
         }
     }
 
@@ -928,6 +939,7 @@ impl Expression {
                 visitor(rhs);
             }
             Expression::EmptyComponentFactory => {}
+            Expression::DebugHook { expression, .. } => visitor(expression),
         }
     }
 
@@ -1024,6 +1036,7 @@ impl Expression {
                 visitor(rhs);
             }
             Expression::EmptyComponentFactory => {}
+            Expression::DebugHook { expression, .. } => visitor(expression),
         }
     }
 
@@ -1105,6 +1118,7 @@ impl Expression {
             Expression::SolveLayout(..) => false,
             Expression::MinMax { lhs, rhs, .. } => lhs.is_constant() && rhs.is_constant(),
             Expression::EmptyComponentFactory => true,
+            Expression::DebugHook { .. } => false,
         }
     }
 
@@ -1404,6 +1418,14 @@ impl Expression {
                 ctx.diag.push_error(format!("{what} needs to be done on a property"), node);
                 false
             }
+        }
+    }
+
+    /// Unwrap DebugHook expressions to their contained sub-expression
+    pub fn ignore_debug_hooks(&self) -> &Expression {
+        match self {
+            Expression::DebugHook { expression, .. } => expression.as_ref(),
+            _ => self,
         }
     }
 }
@@ -1735,5 +1757,10 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             write!(f, ")")
         }
         Expression::EmptyComponentFactory => write!(f, "<empty-component-factory>"),
+        Expression::DebugHook { expression, id } => {
+            write!(f, "debug-hook(")?;
+            pretty_print(f, expression)?;
+            write!(f, "\"{id}\")")
+        }
     }
 }

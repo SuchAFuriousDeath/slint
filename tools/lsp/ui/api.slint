@@ -101,6 +101,7 @@ export struct ColorData {
     b: int,
     a: int,
     text: string,
+    short-text: string,
 }
 
 export enum PropertyValueKind {
@@ -127,6 +128,7 @@ export struct GradientStop {
 
 /// Data about the property value for use in "simple" mode
 export struct PropertyValue {
+    display-string: string, // ALLWAYS, its a string description of what is there
     value-bool: bool, // boolean
     is-translatable: bool, // string
     kind: PropertyValueKind,
@@ -142,8 +144,9 @@ export struct PropertyValue {
     tr-plural: string, // string
     tr-plural-expression: string, // string
     code: string, // ALWAYS, empty if property is not explicitly defined
+    accessor-path: string, // set for struct members and such
     was-edited: bool, // Used by preview dataonly!
-    edited_value: string, // Used in preview dataonly!
+    edited-value: string, // Used in preview dataonly!
 }
 
 export struct PropertyValueTable {
@@ -224,6 +227,7 @@ export global Api {
     // std-widgets are used (=> show style dropdown)
     in-out property <bool> uses-widgets;
     in-out property <bool> always-on-top;
+    in property <bool> focus-previewed-element;
 
     // ## Component Data for ComponentList:
     // All the components
@@ -514,6 +518,10 @@ export global Api {
     // ## preview data
     pure callback get-property-value(component: string, name: string) -> PropertyValue;
     pure callback get-property-value-table(component: string, name: string) -> PropertyValueTable;
+    pure callback set-property-value-table(component: string, name: string, table: [[PropertyValue]], is-array: bool) -> string;
+
+    pure callback insert-row-into-value-table(table: PropertyValueTable, insert-before: int);
+    pure callback remove-row-from-value-table(table: PropertyValueTable, remove-row: int);
 
     pure callback set-json-preview-data(component: string, name: string, json-value: string) -> string;
 
@@ -521,6 +529,11 @@ export global Api {
 
     pure callback add-gradient-stop(stops: [GradientStop], value: GradientStop) -> int;
     pure callback remove-gradient-stop(stops: [GradientStop], row: int);
+    // returns the new index of the gradient stop in the sorted list of GradientStops
+    pure callback move-gradient-stop(stops: [GradientStop], row: int, new_position: float) -> int;
+    pure callback suggest-gradient-stop-at-row(stops: [GradientStop], row: int) -> GradientStop;
+    pure callback suggest-gradient-stop-at-position(stops: [GradientStop], position: float) -> GradientStop;
+    pure callback clone-gradient-stops(stops: [GradientStop]) -> [GradientStop];
 
     pure callback create-brush(kind: BrushKind, angle: float, color: color, stops: [GradientStop]) -> brush;
 

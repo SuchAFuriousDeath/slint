@@ -118,6 +118,8 @@ pub(crate) struct RepeaterWithinItemTree<'par_id, 'sub_id> {
     pub(crate) model: Expression,
     /// Offset of the `Repeater`
     offset: FieldOffset<Instance<'par_id>, Repeater<ErasedItemTreeBox>>,
+    /// Whether this is a `if` or a `for`
+    is_conditional: bool,
 }
 
 impl RepeatedItemTree for ErasedItemTreeBox {
@@ -287,8 +289,6 @@ pub(crate) struct ComponentExtraData {
     pub(crate) globals: OnceCell<crate::global_component::GlobalStorage>,
     pub(crate) self_weak: OnceCell<ErasedItemTreeBoxWeak>,
     pub(crate) embedding_position: OnceCell<(ItemTreeWeak, u32)>,
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) canvas_id: OnceCell<String>,
 }
 
 struct ErasedRepeaterWithinComponent<'id>(RepeaterWithinItemTree<'id, 'static>);
@@ -458,8 +458,6 @@ pub enum WindowOptions {
     #[default]
     CreateNewWindow,
     UseExistingWindow(WindowAdapterRc),
-    #[cfg(target_arch = "wasm32")]
-    CreateWithCanvasId(String),
     Embed {
         parent_item_tree: ItemTreeWeak,
         parent_item_tree_index: u32,
@@ -1052,6 +1050,7 @@ pub(crate) fn generate_item_tree<'id>(
             let base_component = item.base_type.as_component();
             self.repeater_names.insert(item.id.clone(), self.repeater.len());
             generativity::make_guard!(guard);
+            let repeated_element_info = item.repeated.as_ref().unwrap();
             self.repeater.push(
                 RepeaterWithinItemTree {
                     item_tree_to_repeat: generate_item_tree(
@@ -1062,7 +1061,8 @@ pub(crate) fn generate_item_tree<'id>(
                         guard,
                     ),
                     offset: self.type_builder.add_field_type::<Repeater<ErasedItemTreeBox>>(),
-                    model: item.repeated.as_ref().unwrap().model.clone(),
+                    model: repeated_element_info.model.clone(),
+                    is_conditional: repeated_element_info.is_conditional_element,
                 }
                 .into(),
             );
@@ -1224,7 +1224,7 @@ pub(crate) fn generate_item_tree<'id>(
             Type::Struct(_) => property_info::<Value>(),
             Type::Array(_) => property_info::<Value>(),
             Type::Easing => property_info::<i_slint_core::animations::EasingCurve>(),
-            Type::Percent => property_info::<f32>(),
+            Type::Percent => animated_property_info::<f32>(),
             Type::Enumeration(e) => {
                 macro_rules! match_enum_type {
                     ($( $(#[$enum_doc:meta])* enum $Name:ident { $($body:tt)* })*) => {
@@ -1509,11 +1509,6 @@ pub fn instantiate(
         }
         let extra_data = description.extra_data_offset.apply(instance_ref.as_ref());
         extra_data.globals.set(globals).ok().unwrap();
-
-        #[cfg(target_arch = "wasm32")]
-        if let Some(WindowOptions::CreateWithCanvasId(canvas_id)) = window_options {
-            extra_data.canvas_id.set(canvas_id.clone()).unwrap();
-        }
     }
 
     if let Some(WindowOptions::Embed { parent_item_tree, parent_item_tree_index }) = window_options
@@ -1701,14 +1696,23 @@ pub fn instantiate(
         let repeater = rep_in_comp.offset.apply_pin(instance_ref.instance);
         let expr = rep_in_comp.model.clone();
         let model_binding_closure = make_binding_eval_closure(expr, &self_weak);
-        repeater.set_model_binding(move || {
-            let m = model_binding_closure();
-            if let Value::Model(m) = m {
-                m.clone()
-            } else {
-                ModelRc::new(crate::value_model::ValueModel::new(m))
-            }
-        });
+        if rep_in_comp.is_conditional {
+            let bool_model = Rc::new(crate::value_model::BoolModel::default());
+            repeater.set_model_binding(move || {
+                let v = model_binding_closure();
+                bool_model.set_value(v.try_into().expect("condition model is bool"));
+                ModelRc::from(bool_model.clone())
+            });
+        } else {
+            repeater.set_model_binding(move || {
+                let m = model_binding_closure();
+                if let Value::Model(m) = m {
+                    m.clone()
+                } else {
+                    ModelRc::new(crate::value_model::ValueModel::new(m))
+                }
+            });
+        }
     }
     self_rc
 }
@@ -2288,12 +2292,7 @@ impl<'a, 'id> InstanceRef<'a, 'id> {
                 let extra_data = description.extra_data_offset.apply(instance);
                 let window_adapter = // We are the root: Create a window adapter
                     i_slint_backend_selector::with_platform(|_b| {
-                        #[cfg(not(target_arch = "wasm32"))]
                         return _b.create_window_adapter();
-                        #[cfg(target_arch = "wasm32")]
-                        i_slint_backend_winit::create_gl_window_with_canvas_id(
-                            extra_data.canvas_id.get().map_or("canvas", |s| s.as_str()),
-                        )
                     })?;
 
                 let comp_rc = extra_data.self_weak.get().unwrap().upgrade().unwrap();

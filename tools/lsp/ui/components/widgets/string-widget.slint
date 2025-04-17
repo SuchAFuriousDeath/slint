@@ -23,10 +23,10 @@ export component StringWidget inherits GridLayout {
 
     property <bool> open: false;
 
-    private property <PropertyValue> dummy: self.property-value;
-
     private property <bool> is-translated;
     private property <string> tr-context-value;
+
+    callback update-display-string(value: string);
 
     callback code-action();
     callback reset-action();
@@ -38,6 +38,7 @@ export component StringWidget inherits GridLayout {
         return test-string-binding(Api.string-to-code(text-rle.text, self.is-translated, self.tr-context-value, "", ""), self.is-translated);
     }
     function ssb() {
+        update-display-string("\"\{text-rle.text}\"");
         set-string-binding(Api.string-to-code(text-rle.text, self.is-translated, self.tr-context-value, "", ""), self.is-translated);
     }
 
@@ -62,14 +63,13 @@ export component StringWidget inherits GridLayout {
         }
     }
 
-    changed dummy => {
+    changed property-value => {
         if !has-focus {
             apply-value();
         }
     }
 
     spacing-vertical: EditorSpaceSettings.default-spacing;
-    width: 100%;
 
     Row {
         NameLabel {

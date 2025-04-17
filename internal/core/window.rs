@@ -572,11 +572,6 @@ impl WindowInner {
 
     /// Receive a mouse event and pass it to the items of the component to
     /// change their state.
-    ///
-    /// Arguments:
-    /// * `pos`: The position of the mouse event in window physical coordinates.
-    /// * `what`: The type of mouse event.
-    /// * `component`: The Slint compiled component that provides the tree of items.
     pub fn process_mouse_input(&self, mut event: MouseEvent) {
         crate::animations::update_animations();
 
@@ -594,9 +589,11 @@ impl WindowInner {
                 crate::input::process_delayed_event(&window_adapter, mouse_input_state);
         }
 
+        let Some(item_tree) = self.try_component() else { return };
+
         // Try to get the root window in case `self` is the popup itself (to get the active_popups list)
         let mut root_adapter = None;
-        ItemTreeRc::borrow_pin(&self.component()).as_ref().window_adapter(false, &mut root_adapter);
+        ItemTreeRc::borrow_pin(&item_tree).as_ref().window_adapter(false, &mut root_adapter);
         let root_adapter = root_adapter.unwrap_or_else(|| window_adapter.clone());
         let active_popups = &WindowInner::from_pub(root_adapter.window()).active_popups;
         let native_popup_index = active_popups.borrow().iter().position(|p| {
@@ -623,7 +620,7 @@ impl WindowInner {
                 } else {
                     native_popup_index.is_some_and(|idx| idx == active_popups.borrow().len() - 1)
                         && event.position().is_none_or(|pos| {
-                            ItemTreeRc::borrow_pin(&self.component())
+                            ItemTreeRc::borrow_pin(&item_tree)
                                 .as_ref()
                                 .item_geometry(0)
                                 .contains(pos)
@@ -647,8 +644,10 @@ impl WindowInner {
         {
             let mut item_tree = self.component.borrow().upgrade();
             let mut offset = LogicalPoint::default();
+            let mut menubar_item = None;
             for (idx, popup) in active_popups.borrow().iter().enumerate().rev() {
                 item_tree = None;
+                menubar_item = None;
                 if let PopupWindowLocation::ChildWindow(coordinates) = &popup.location {
                     let geom = ItemTreeRc::borrow_pin(&popup.component).as_ref().item_geometry(0);
                     let mouse_inside_popup = event
@@ -670,12 +669,27 @@ impl WindowInner {
                     // clicking outside of a popup menu should close all the menus
                     popup_to_close = Some(popup.popup_id);
                 }
+
+                menubar_item = popup.parent_item.upgrade();
             }
 
-            if let Some(item_tree) = item_tree {
+            let root = match menubar_item {
+                None => item_tree.map(|item_tree| ItemRc::new(item_tree.clone(), 0)),
+                Some(menubar_item) => {
+                    assert_ne!(menubar_item.index(), 0, "ContextMenuInternal cannot be root");
+                    event.translate(
+                        menubar_item
+                            .map_to_item_tree(Default::default(), &self.component())
+                            .to_vector(),
+                    );
+                    menubar_item.parent_item()
+                }
+            };
+
+            if let Some(root) = root {
                 event.translate(-offset.to_vector());
                 let mut new_input_state = crate::input::process_mouse_input(
-                    item_tree,
+                    root,
                     event,
                     &window_adapter,
                     mouse_input_state,

@@ -618,6 +618,44 @@ impl Model for bool {
 ///     the_model.push("An Item".into());
 /// });
 /// ```
+///
+/// ### Updating the Model from a Thread
+///
+/// `ModelRc` is not `Send` and can only be used in the main thread.
+/// If you want to update the model based on data coming from another thread, you need to send back the data to the main thread
+/// using [`invoke_from_event_loop`](crate::api::invoke_from_event_loop) or
+/// [`Weak::upgrade_in_event_loop`](crate::api::Weak::upgrade_in_event_loop).
+///
+/// ```rust
+/// # i_slint_backend_testing::init_integration_test_with_mock_time();
+/// use slint::Model;
+/// slint::slint!{
+///     export component TestCase inherits Window {
+///         in property <[string]> the_model;
+///         //...
+///     }
+/// }
+/// let ui = TestCase::new().unwrap();
+/// // set a model (a VecModel)
+/// let model = std::rc::Rc::new(slint::VecModel::<slint::SharedString>::default());
+/// ui.set_the_model(model.clone().into());
+///
+/// // do some work in a thread
+/// let ui_weak = ui.as_weak();
+/// let thread = std::thread::spawn(move || {
+///     // do some work
+///     let new_strings = vec!["foo".into(), "bar".into()];
+///     // send the data back to the main thread
+///     ui_weak.upgrade_in_event_loop(move |ui| {
+///         let model = ui.get_the_model();
+///         let model = model.as_any().downcast_ref::<slint::VecModel<slint::SharedString>>()
+///             .expect("We know we set a VecModel earlier");
+///         model.set_vec(new_strings);
+/// #       slint::quit_event_loop().unwrap();
+///     });
+/// });
+/// ui.run().unwrap();
+/// ```
 pub struct ModelRc<T>(Option<Rc<dyn Model<Data = T>>>);
 
 impl<T> core::fmt::Debug for ModelRc<T> {
@@ -1271,6 +1309,91 @@ impl<C: RepeatedItemTree + 'static> Repeater<C> {
     /// Returns a vector containing all instances
     pub fn instances_vec(&self) -> Vec<ItemTreeRc<C>> {
         self.0.inner.borrow().instances.iter().flat_map(|x| x.1.clone()).collect()
+    }
+}
+
+#[pin_project]
+pub struct Conditional<C: RepeatedItemTree> {
+    #[pin]
+    model: Property<bool>,
+    instance: RefCell<Option<ItemTreeRc<C>>>,
+}
+
+impl<C: RepeatedItemTree> Default for Conditional<C> {
+    fn default() -> Self {
+        Self {
+            model: Property::new_named(false, "i_slint_core::Conditional::model"),
+            instance: RefCell::new(None),
+        }
+    }
+}
+
+impl<C: RepeatedItemTree + 'static> Conditional<C> {
+    /// Call this function to make sure that the model is updated.
+    /// The init function is the function to create a ItemTree
+    pub fn ensure_updated(self: Pin<&Self>, init: impl Fn() -> ItemTreeRc<C>) {
+        let model = self.project_ref().model.get();
+
+        if !model {
+            drop(self.instance.replace(None));
+        } else if self.instance.borrow().is_none() {
+            let i = init();
+            self.instance.replace(Some(i.clone()));
+            i.init();
+        }
+    }
+
+    /// Set the model binding
+    pub fn set_model_binding(&self, binding: impl Fn() -> bool + 'static) {
+        self.model.set_binding(binding);
+    }
+
+    /// Call the visitor for the root of each instance
+    pub fn visit(
+        &self,
+        order: TraversalOrder,
+        mut visitor: crate::item_tree::ItemVisitorRefMut,
+    ) -> crate::item_tree::VisitChildrenResult {
+        // We can't keep self.inner borrowed because the event might modify the model
+        let instance = self.instance.borrow().clone();
+        if let Some(c) = instance {
+            if c.as_pin_ref().visit_children_item(-1, order, visitor.borrow_mut()).has_aborted() {
+                return crate::item_tree::VisitChildrenResult::abort(0, 0);
+            }
+        }
+
+        crate::item_tree::VisitChildrenResult::CONTINUE
+    }
+
+    /// Return the amount of instances (1 if the conditional is active, 0 otherwise)
+    pub fn len(&self) -> usize {
+        self.instance.borrow().is_some() as usize
+    }
+
+    /// Return the range of indices used by this Conditional.
+    ///
+    /// Similar to Repeater::range, but the range is always [0, 1] if the Conditional is active.
+    pub fn range(&self) -> core::ops::Range<usize> {
+        0..self.len()
+    }
+
+    /// Return the instance for the given model index.
+    /// The index should be within [`Self::range()`]
+    pub fn instance_at(&self, index: usize) -> Option<ItemTreeRc<C>> {
+        if index != 0 {
+            return None;
+        }
+        self.instance.borrow().clone()
+    }
+
+    /// Return true if the Repeater as empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns a vector containing all instances
+    pub fn instances_vec(&self) -> Vec<ItemTreeRc<C>> {
+        self.instance.borrow().clone().into_iter().collect()
     }
 }
 

@@ -53,3 +53,9 @@ updates:
         patterns:
           - "playwright*"
           - "@playwright*"
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"

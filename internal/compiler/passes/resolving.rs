@@ -26,6 +26,7 @@ use std::rc::Rc;
 struct ComponentScope(Vec<ElementRc>);
 
 fn resolve_expression(
+    elem: &ElementRc,
     expr: &mut Expression,
     property_name: Option<&str>,
     property_type: Type,
@@ -34,7 +35,7 @@ fn resolve_expression(
     type_loader: &crate::typeloader::TypeLoader,
     diag: &mut BuildDiagnostics,
 ) {
-    if let Expression::Uncompiled(node) = expr {
+    if let Expression::Uncompiled(node) = expr.ignore_debug_hooks() {
         let mut lookup_ctx = LookupCtx {
             property_name,
             property_type,
@@ -48,7 +49,11 @@ fn resolve_expression(
 
         let new_expr = match node.kind() {
             SyntaxKind::CallbackConnection => {
-                Expression::from_callback_connection(node.clone().into(), &mut lookup_ctx)
+                let node = syntax_nodes::CallbackConnection::from(node.clone());
+                if let Some(property_name) = property_name {
+                    check_callback_alias_validity(&node, elem, property_name, lookup_ctx.diag);
+                }
+                Expression::from_callback_connection(node, &mut lookup_ctx)
             }
             SyntaxKind::Function => Expression::from_function(node.clone().into(), &mut lookup_ctx),
             SyntaxKind::Expression => {
@@ -72,7 +77,10 @@ fn resolve_expression(
                 Expression::Invalid
             }
         };
-        *expr = new_expr;
+        match expr {
+            Expression::DebugHook { expression, .. } => *expression = Box::new(new_expr),
+            _ => *expr = new_expr,
+        }
     }
 }
 
@@ -123,6 +131,7 @@ pub fn resolve_expressions(
                     };
 
                     resolve_expression(
+                        elem,
                         expr,
                         property_name,
                         property_type(),
@@ -426,7 +435,7 @@ impl Expression {
         }
     }
 
-    fn from_at_gradient(node: syntax_nodes::AtGradient, ctx: &mut LookupCtx) -> Self {
+    pub fn from_at_gradient(node: syntax_nodes::AtGradient, ctx: &mut LookupCtx) -> Self {
         enum GradKind {
             Linear { angle: Box<Expression> },
             Radial,
@@ -1448,7 +1457,7 @@ fn continue_lookup_within_element(
         Some(LookupResult::Callable(LookupResultCallable::Callable(Callable::Callback(
             NamedReference::new(elem, lookup_result.resolved_name.to_smolstr()),
         ))))
-    } else if matches!(lookup_result.property_type, Type::Function { .. }) {
+    } else if let Type::Function(fun) = lookup_result.property_type {
         if lookup_result.property_visibility == PropertyVisibility::Private && !local_to_component {
             let message = format!("The function '{}' is private. Annotate it with 'public' to make it accessible from other components", second.text());
             if !lookup_result.is_local_to_component {
@@ -1466,22 +1475,22 @@ fn continue_lookup_within_element(
         if let Some(x) = it.next() {
             ctx.diag.push_error("Cannot access fields of a function".into(), &x)
         }
-        if let Some(f) =
-            elem.borrow().base_type.lookup_member_function(&lookup_result.resolved_name)
-        {
-            // builtin member function
+        let callable = match lookup_result.builtin_function {
+            Some(builtin) => Callable::Builtin(builtin),
+            None => Callable::Function(NamedReference::new(
+                elem,
+                lookup_result.resolved_name.to_smolstr(),
+            )),
+        };
+        if matches!(fun.args.first(), Some(Type::ElementReference)) {
             LookupResult::Callable(LookupResultCallable::MemberFunction {
                 base: Expression::ElementReference(Rc::downgrade(elem)),
                 base_node: Some(NodeOrToken::Node(node.into())),
-                member: Box::new(LookupResultCallable::Callable(f.into())),
+                member: Box::new(LookupResultCallable::Callable(callable)),
             })
             .into()
         } else {
-            LookupResult::from(Callable::Function(NamedReference::new(
-                elem,
-                lookup_result.resolved_name.to_smolstr(),
-            )))
-            .into()
+            LookupResult::from(callable).into()
         }
     } else {
         let mut err = |extra: &str| {
@@ -1594,7 +1603,9 @@ fn resolve_two_way_bindings(
             &mut |elem, scope| {
                 for (prop_name, binding) in &elem.borrow().bindings {
                     let mut binding = binding.borrow_mut();
-                    if let Expression::Uncompiled(node) = binding.expression.clone() {
+                    if let Expression::Uncompiled(node) =
+                        binding.expression.ignore_debug_hooks().clone()
+                    {
                         if let Some(n) = syntax_nodes::TwoWayBinding::new(node.clone()) {
                             let lhs_lookup = elem.borrow().lookup_property(prop_name);
                             if !lhs_lookup.is_valid() {
@@ -1785,6 +1796,46 @@ pub fn resolve_two_way_binding(
                 &node,
             );
             None
+        }
+    }
+}
+
+/// For connection to callback aliases, some check are to be performed later
+fn check_callback_alias_validity(
+    node: &syntax_nodes::CallbackConnection,
+    elem: &ElementRc,
+    name: &str,
+    diag: &mut BuildDiagnostics,
+) {
+    let elem_borrow = elem.borrow();
+    let Some(decl) = elem_borrow.property_declarations.get(name) else {
+        if let ElementType::Component(c) = &elem_borrow.base_type {
+            check_callback_alias_validity(node, &c.root_element, name, diag);
+        }
+        return;
+    };
+    let Some(b) = elem_borrow.bindings.get(name) else { return };
+    // `try_borrow` because we might be called for the current binding
+    let Some(alias) = b.try_borrow().ok().and_then(|b| b.two_way_bindings.first().cloned()) else {
+        return;
+    };
+
+    if alias.element().borrow().base_type == ElementType::Global {
+        diag.push_error(
+            "Can't assign a local callback handler to an alias to a global callback".into(),
+            &node.child_token(SyntaxKind::Identifier).unwrap(),
+        );
+    }
+    if let Type::Callback(callback) = &decl.property_type {
+        let num_arg = node.DeclaredIdentifier().count();
+        if num_arg > callback.args.len() {
+            diag.push_error(
+                format!(
+                    "'{name}' only has {} arguments, but {num_arg} were provided",
+                    callback.args.len(),
+                ),
+                &node.child_token(SyntaxKind::Identifier).unwrap(),
+            );
         }
     }
 }

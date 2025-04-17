@@ -766,9 +766,8 @@ fn generate_sub_component(
         }
     }
 
-    let mut repeated_element_names: Vec<Ident> = vec![];
     let mut repeated_visit_branch: Vec<TokenStream> = vec![];
-    let mut repeated_element_components: Vec<Ident> = vec![];
+    let mut repeated_element_components: Vec<TokenStream> = vec![];
     let mut repeated_subtree_ranges: Vec<TokenStream> = vec![];
     let mut repeated_subtree_components: Vec<TokenStream> = vec![];
 
@@ -783,11 +782,7 @@ fn generate_sub_component(
         let rep_inner_component_id =
             self::inner_component_id(&root.sub_components[repeated.sub_tree.root]);
 
-        let mut model = compile_expression(&repeated.model.borrow(), &ctx);
-        if repeated.model.ty(&ctx) == Type::Bool {
-            model = quote!(sp::ModelRc::new(#model as bool))
-        }
-
+        let model = compile_expression(&repeated.model.borrow(), &ctx);
         init.push(quote! {
             _self.#repeater_id.set_model_binding({
                 let self_weak = sp::VRcMapped::downgrade(&self_rc);
@@ -838,8 +833,11 @@ fn generate_sub_component(
                 }
             }
         ));
-        repeated_element_names.push(repeater_id);
-        repeated_element_components.push(rep_inner_component_id);
+        repeated_element_components.push(if repeated.index_prop.is_some() {
+            quote!(#repeater_id: sp::Repeater<#rep_inner_component_id>)
+        } else {
+            quote!(#repeater_id: sp::Conditional<#rep_inner_component_id>)
+        });
     }
 
     // Use ids following the real repeaters to piggyback on their forwarding through sub-components!
@@ -1149,7 +1147,7 @@ fn generate_sub_component(
             #(#popup_id_names : ::core::cell::Cell<sp::Option<::core::num::NonZeroU32>>,)*
             #(#declared_property_vars : sp::Property<#declared_property_types>,)*
             #(#declared_callbacks : sp::Callback<(#(#declared_callbacks_types,)*), #declared_callbacks_ret>,)*
-            #(#repeated_element_names : sp::Repeater<#repeated_element_components>,)*
+            #(#repeated_element_components,)*
             #(#change_tracker_names : sp::ChangeTracker,)*
             #(#timer_names : sp::Timer,)*
             self_weak : sp::OnceCell<sp::VWeakMapped<sp::ItemTreeVTable, #inner_component_id>>,
@@ -1900,7 +1898,7 @@ fn access_member(reference: &llr::PropertyReference, ctx: &EvaluationContext) ->
         item_index: llr::ItemInstanceIdx,
         prop_name: &str,
         path: TokenStream,
-    ) -> TokenStream {
+    ) -> (TokenStream, Option<TokenStream>) {
         let (compo_path, sub_component) = follow_sub_component_path(
             ctx.compilation_unit,
             ctx.current_sub_component.unwrap(),
@@ -1911,11 +1909,20 @@ fn access_member(reference: &llr::PropertyReference, ctx: &EvaluationContext) ->
         let item_field = access_component_field_offset(&component_id, &item_name);
         if prop_name.is_empty() {
             // then this is actually a reference to the element itself
-            quote!((#compo_path #item_field).apply_pin(#path))
+            (quote!((#compo_path #item_field).apply_pin(#path)), None)
+        } else if matches!(
+            sub_component.items[item_index].ty.lookup_property(prop_name),
+            Some(&Type::Function(..))
+        ) {
+            let property_name = ident(prop_name);
+            (quote!((#compo_path #item_field).apply_pin(#path)), Some(quote!(.#property_name)))
         } else {
             let property_name = ident(prop_name);
             let item_ty = ident(&sub_component.items[item_index].ty.class_name);
-            quote!((#compo_path #item_field + sp::#item_ty::FIELD_OFFSETS.#property_name).apply_pin(#path))
+            (
+                quote!((#compo_path #item_field + sp::#item_ty::FIELD_OFFSETS.#property_name).apply_pin(#path)),
+                None,
+            )
         }
     }
     match reference {
@@ -1940,13 +1947,9 @@ fn access_member(reference: &llr::PropertyReference, ctx: &EvaluationContext) ->
             }
         }
         llr::PropertyReference::InNativeItem { sub_component_path, item_index, prop_name } => {
-            MemberAccess::Direct(in_native_item(
-                ctx,
-                sub_component_path,
-                *item_index,
-                prop_name,
-                quote!(_self),
-            ))
+            let (a, b) =
+                in_native_item(ctx, sub_component_path, *item_index, prop_name, quote!(_self));
+            MemberAccess::Direct(quote!(#a #b))
         }
         llr::PropertyReference::InParent { level, parent_reference } => {
             let mut path = quote!(_self.parent.upgrade());
@@ -1975,14 +1978,18 @@ fn access_member(reference: &llr::PropertyReference, ctx: &EvaluationContext) ->
                     item_index,
                     prop_name,
                 } => {
-                    let in_native = in_native_item(
+                    let (a, b) = in_native_item(
                         ctx,
                         sub_component_path,
                         *item_index,
                         prop_name,
                         quote!(x.as_pin_ref()),
                     );
-                    MemberAccess::Option(quote!(#path.as_ref().map(|x| #in_native)))
+                    let opt = quote!(#path.as_ref().map(|x| #a));
+                    match b {
+                        None => MemberAccess::Option(opt),
+                        Some(b) => MemberAccess::OptionFn(opt, quote!(|x| x #b)),
+                    }
                 }
                 llr::PropertyReference::Function { sub_component_path, function_index } => {
                     let mut sub_component = ctx.current_sub_component().unwrap();
@@ -2154,9 +2161,7 @@ fn access_item_rc(pr: &llr::PropertyReference, ctx: &EvaluationContext) -> Token
     };
 
     match pr {
-        llr::PropertyReference::InNativeItem { sub_component_path, item_index, prop_name } => {
-            assert!(prop_name.is_empty());
-
+        llr::PropertyReference::InNativeItem { sub_component_path, item_index, prop_name: _ } => {
             let root = ctx.current_sub_component().unwrap();
             let mut sub_component = root;
             for i in sub_component_path {
@@ -2288,7 +2293,12 @@ fn compile_expression(expr: &Expression, ctx: &EvaluationContext) -> TokenStream
                 f.map_or_default(|f| quote!(#f( #(#a as _),*)))
             }
         }
-
+        Expression::ItemMemberFunctionCall { function } => {
+            let fun = access_member(function, ctx);
+            let item_rc = access_item_rc(function, ctx);
+            let window_adapter_tokens = access_window_adapter_field(ctx);
+            fun.map_or_default(|fun| quote!(#fun(#window_adapter_tokens, #item_rc)))
+        }
         Expression::ExtraBuiltinFunctionCall { function, arguments, return_ty: _ } => {
             let f = ident(function);
             let a = arguments.iter().map(|a| {
@@ -2896,21 +2906,6 @@ fn compile_builtin_function_call(
                 panic!("internal error: invalid args to set-selection-offsets {arguments:?}")
             }
         }
-        BuiltinFunction::ItemMemberFunction(name) => {
-            if let [Expression::PropertyReference(pr)] = arguments {
-                let item = access_member(pr, ctx);
-                let item_rc = access_item_rc(pr, ctx);
-                let window_adapter_tokens = access_window_adapter_field(ctx);
-                let name = ident(&name);
-                item.then(|item| {
-                    quote!(
-                        #item.#name(#window_adapter_tokens, #item_rc)
-                    )
-                })
-            } else {
-                panic!("internal error: invalid args to ItemMemberFunction {arguments:?}")
-            }
-        }
         BuiltinFunction::ItemFontMetrics => {
             if let [Expression::PropertyReference(pr)] = arguments {
                 let item = access_member(pr, ctx);
@@ -3021,6 +3016,8 @@ fn compile_builtin_function_call(
         BuiltinFunction::StringCharacterCount => {
             quote!( sp::UnicodeSegmentation::graphemes(#(#a)*.as_str(), true).count() as i32 )
         }
+        BuiltinFunction::StringToLowercase => quote!(sp::SharedString::from(#(#a)*.to_lowercase())),
+        BuiltinFunction::StringToUppercase => quote!(sp::SharedString::from(#(#a)*.to_uppercase())),
         BuiltinFunction::ColorRgbaStruct => quote!( #(#a)*.to_argb_u8()),
         BuiltinFunction::ColorHsvaStruct => quote!( #(#a)*.to_hsva()),
         BuiltinFunction::ColorBrighter => {
@@ -3072,11 +3069,10 @@ fn compile_builtin_function_call(
             let (h, s, v, a) =
                 (a.next().unwrap(), a.next().unwrap(), a.next().unwrap(), a.next().unwrap());
             quote!({
-                let h: f32 = (#h as f32).clamp(0., 360.) as f32;
                 let s: f32 = (#s as f32).max(0.).min(1.) as f32;
                 let v: f32 = (#v as f32).max(0.).min(1.) as f32;
                 let a: f32 = (1. * (#a as f32)).max(0.).min(1.) as f32;
-                sp::Color::from_hsva(h, s, v, a)
+                sp::Color::from_hsva(#h as f32, s, v, a)
             })
         }
         BuiltinFunction::ColorScheme => {
@@ -3089,7 +3085,7 @@ fn compile_builtin_function_call(
         }
         BuiltinFunction::SetupNativeMenuBar => {
             let window_adapter_tokens = access_window_adapter_field(ctx);
-            if let [Expression::PropertyReference(entries_r), Expression::PropertyReference(sub_menu_r), Expression::PropertyReference(activated_r), Expression::NumberLiteral(tree_index)] =
+            if let [Expression::PropertyReference(entries_r), Expression::PropertyReference(sub_menu_r), Expression::PropertyReference(activated_r), Expression::NumberLiteral(tree_index), Expression::BoolLiteral(no_native)] =
                 arguments
             {
                 // We have an MenuItem tree
@@ -3103,12 +3099,19 @@ fn compile_builtin_function_call(
                 let access_sub_menu = access_member(sub_menu_r, ctx).unwrap();
                 let access_activated = access_member(activated_r, ctx).unwrap();
 
+                let native_impl = if *no_native {
+                    quote!()
+                } else {
+                    quote!(if sp::WindowInner::from_pub(#window_adapter_tokens.window()).supports_native_menu_bar() {
+                        sp::WindowInner::from_pub(#window_adapter_tokens.window()).setup_menubar(sp::VBox::new(menu_item_tree));
+                    } else)
+                };
+
                 quote!({
                     let menu_item_tree_instance = #item_tree_id::new(_self.self_weak.get().unwrap().clone()).unwrap();
                     let menu_item_tree = sp::MenuFromItemTree::new(sp::VRc::into_dyn(menu_item_tree_instance));
-                    if sp::WindowInner::from_pub(#window_adapter_tokens.window()).supports_native_menu_bar() {
-                        sp::WindowInner::from_pub(#window_adapter_tokens.window()).setup_menubar(sp::VBox::new(menu_item_tree));
-                    } else {
+                    #native_impl
+                    /*else*/ {
                         let menu_item_tree = sp::Rc::new(menu_item_tree);
                         let menu_item_tree_ = menu_item_tree.clone();
                         #access_entries.set_binding(move || {
@@ -3315,8 +3318,9 @@ fn embedded_file_tokens(path: &str) -> TokenStream {
 
 fn generate_resources(doc: &Document) -> Vec<TokenStream> {
     #[cfg(feature = "software-renderer")]
-    let link_section =
-        std::env::var("SLINT_ASSET_SECTION").ok().map(|section| quote!(#[link_section = #section]));
+    let link_section = std::env::var("SLINT_ASSET_SECTION")
+        .ok()
+        .map(|section| quote!(#[unsafe(link_section = #section)]));
 
     doc.embedded_file_resources
         .borrow()
